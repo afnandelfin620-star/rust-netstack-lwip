@@ -239,6 +239,9 @@ impl AsyncRead for TcpStream {
             consumed += to_read;
             result = Poll::Ready(Ok(()));
         } else {
+            if me.is_eof {
+                return Poll::Ready(Ok(()));
+            }
             let mut has_read_data = false;
             loop {
                 match Pin::new(&mut me.read_rx).poll_recv(cx) {
@@ -277,7 +280,7 @@ impl AsyncRead for TcpStream {
                         break;
                     }
                     Poll::Pending => {
-                        result = if has_read_data || me.is_eof {
+                        result = if has_read_data {
                             Poll::Ready(Ok(()))
                         } else {
                             Poll::Pending
@@ -356,6 +359,9 @@ impl AsyncWrite for TcpStream {
         }
         let to_write = buf.len().min(self.send_buf_size()).min(u16::MAX as usize);
         if to_write == 0 {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
             self.callback_ctx.write_waker.register(cx.waker());
             return Poll::Pending;
         }
@@ -387,10 +393,9 @@ impl AsyncWrite for TcpStream {
             self.callback_ctx.write_waker.register(cx.waker());
             Poll::Pending
         } else {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("netstack tcp_write error {}", err),
-            )))
+            // Operation errors do not free the PCB. Drop must still detach
+            // callbacks and release it; only lwIP lifecycle callbacks mark it gone.
+            Poll::Ready(Err(broken_pipe()))
         }
     }
 
@@ -414,14 +419,11 @@ impl AsyncWrite for TcpStream {
             self.callback_ctx.write_waker.register(cx.waker());
             Poll::Pending
         } else {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("netstack tcp_output error {}", err),
-            )))
+            Poll::Ready(Err(broken_pipe()))
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let _guard = LWIP_MUTEX.lock();
         if self.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
@@ -435,11 +437,11 @@ impl AsyncWrite for TcpStream {
         }
         trace!("netstack tcp shutdown {}", &self.callback_ctx.local_addr);
         let err = unsafe { tcp_shutdown(self.pcb as *mut tcp_pcb, 0, 1) };
-        if err != err_enum_t_ERR_OK as err_t {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("netstack tcp_shutdown tx error {}", err),
-            )))
+        if err == err_enum_t_ERR_MEM as err_t {
+            self.callback_ctx.write_waker.register(cx.waker());
+            Poll::Pending
+        } else if err != err_enum_t_ERR_OK as err_t {
+            Poll::Ready(Err(broken_pipe()))
         } else {
             self.callback_ctx.tx_closed.store(true, Ordering::Release);
             Poll::Ready(Ok(()))

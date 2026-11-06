@@ -236,14 +236,14 @@ impl Sink<Vec<u8>> for NetStack {
                 } else {
                     pbuf_free(pbuf);
                     Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
+                        io::ErrorKind::Other,
                         format!("input error: {}", err),
                     )))
                 }
             } else {
                 pbuf_free(pbuf);
                 Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
+                    io::ErrorKind::Other,
                     "input fn not set",
                 )))
             }
@@ -252,5 +252,57 @@ impl Sink<Vec<u8>> for NetStack {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+
+#[cfg(test)]
+mod error_lifecycle_tests {
+    use super::*;
+    use crate::tcp_stream::{TcpStream, tcp_recv_cb};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    #[test]
+    fn failed_write_and_shutdown_preserve_pcb_cleanup_and_eof() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (_stack, handle) = NetStack::_new(32).unwrap();
+            for shutdown in [false, true] {
+                let pcb = {
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        let pcb = tcp_new(); assert!(!pcb.is_null());
+                        assert_eq!(tcp_bind(pcb, std::ptr::null(), 54321), err_enum_t_ERR_OK as err_t);
+                        pcb
+                    }
+                };
+                let mut stream = { let _lock = LWIP_MUTEX.lock(); TcpStream::new(pcb, handle.clone()) };
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                // A bound CLOSED PCB is alive but cannot write or SHUT_WR (ERR_CONN).
+                // Poll once first: a regression to Interrupted must fail, not hang write_all.
+                let error = if shutdown {
+                    match stream.as_mut().poll_shutdown(&mut cx) { Poll::Ready(Err(e)) => e, _ => panic!("expected shutdown error") }
+                } else {
+                    match stream.as_mut().poll_write(&mut cx, b"x") { Poll::Ready(Err(e)) => e, _ => panic!("expected write error") }
+                };
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(stream.write_all(b"x").await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+                // Error must not have pretended the PCB was freed: its callback is still valid.
+                { let _lock = LWIP_MUTEX.lock(); unsafe {
+                    tcp_recv_cb((*pcb).callback_arg, pcb, std::ptr::null_mut(), err_enum_t_ERR_OK as err_t);
+                } }
+                let mut data = [0;1];
+                assert_eq!(stream.read(&mut data).await.unwrap(), 0);
+                assert_eq!(stream.read(&mut data).await.unwrap(), 0);
+                drop(stream);
+                // Actual destruction must release the bind, not leave a PCB with dangling callbacks.
+                { let _lock = LWIP_MUTEX.lock(); unsafe {
+                    let replacement = tcp_new(); assert!(!replacement.is_null());
+                    let result = tcp_bind(replacement, std::ptr::null(), 54321);
+                    tcp_abort(replacement);
+                    assert_eq!(result, err_enum_t_ERR_OK as err_t, "old PCB leaked its port");
+                } }
+            }
+        });
     }
 }

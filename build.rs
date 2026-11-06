@@ -92,14 +92,8 @@ fn generate_lwip_bindings(out_path: &Path) {
     println!("cargo:rerun-if-changed=src/wrapper.h");
     println!("cargo:include=src/lwip/include");
 
-    let bindings_dest = out_path.join("bindings.rs");
-    let fallback_bindings = Path::new("src/bindings.rs");
-
-    if env::var("FORCE_BINDGEN").is_err() && fallback_bindings.exists() {
-        std::fs::copy(fallback_bindings, &bindings_dest).expect("Failed to copy pre-generated bindings");
-        return;
-    }
-
+    // Always generate for the actual target and lwipopts.h. The checked-in
+    // bindings predate window scaling and have incompatible tcp_pcb offsets.
     let sdk_include_path = sdk_include_path();
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
