@@ -92,6 +92,14 @@ fn generate_lwip_bindings(out_path: &Path) {
     println!("cargo:rerun-if-changed=src/wrapper.h");
     println!("cargo:include=src/lwip/include");
 
+    let bindings_dest = out_path.join("bindings.rs");
+    let fallback_bindings = Path::new("src/bindings.rs");
+
+    if env::var("FORCE_BINDGEN").is_err() && fallback_bindings.exists() {
+        std::fs::copy(fallback_bindings, &bindings_dest).expect("Failed to copy pre-generated bindings");
+        return;
+    }
+
     let sdk_include_path = sdk_include_path();
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
@@ -105,6 +113,19 @@ fn generate_lwip_bindings(out_path: &Path) {
         .clang_arg("-Wno-everything")
         .layout_tests(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+    if os == "android" {
+        let cc_key = format!("CC_{}", target.replace('-', "_"));
+        let compiler = env::var(&cc_key).expect("Set the Android target CC to its NDK clang compiler");
+        let root = Path::new(&compiler).parent().unwrap().parent().unwrap().join("sysroot");
+        let clang_root = root.parent().unwrap().join("lib/clang");
+        let resource = std::fs::read_dir(clang_root).unwrap()
+            .filter_map(Result::ok).map(|e| e.path())
+            .find(|p| p.join("include/stddef.h").exists())
+            .expect("NDK clang builtin headers missing");
+        builder = builder.clang_arg(format!("-resource-dir={}", resource.display()));
+        builder = builder.clang_arg(format!("--sysroot={}", root.display()))
+            .clang_arg(format!("-I{}", root.join("usr/include").join(&target).display()));
+    }
     // Parse the headers with the actual target's ABI so struct layouts and
     // integer/pointer widths match the target rather than the build host.
     if arch == "aarch64" && os == "ios" {
@@ -125,13 +146,10 @@ fn generate_lwip_bindings(out_path: &Path) {
 }
 
 fn main() {
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let pregenerated = Path::new("src/bindings.rs");
-    if env::var("BINDINGS_GEN").is_ok() || !pregenerated.exists() {
-        generate_lwip_bindings(&out_path);
-    } else {
-        std::fs::copy(pregenerated, out_path.join("bindings.rs"))
-            .expect("Couldn't copy pre-generated bindings.rs");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=bcrypt");
     }
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    generate_lwip_bindings(&out_path);
     compile_lwip();
 }

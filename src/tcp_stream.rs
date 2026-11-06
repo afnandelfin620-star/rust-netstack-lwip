@@ -3,7 +3,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin};
 
-use bytes::BytesMut;
 use futures::task::{Context, Poll};
 use log::*;
 use tokio::{
@@ -124,7 +123,8 @@ pub struct TcpStream {
     dest_addr: SocketAddr,
     pcb: usize,
     // Overflow buffer for read data that didn't fit the caller's buffer.
-    read_overflow: BytesMut,
+    read_overflow: Vec<u8>,
+    read_offset: usize,
     callback_ctx: TcpStreamContext,
     // Receiving end of the channel fed by `tcp_recv_cb`; owned solely by the
     // async side, so it needs no sharing/locking.
@@ -154,7 +154,8 @@ impl TcpStream {
                 src_addr,
                 dest_addr,
                 pcb: pcb as usize,
-                read_overflow: BytesMut::new(),
+                read_overflow: Vec::new(),
+                read_offset: 0,
                 callback_ctx: TcpStreamContext::new(src_addr, read_tx),
                 read_rx,
                 is_eof: false,
@@ -227,10 +228,14 @@ impl AsyncRead for TcpStream {
         let mut consumed: usize = 0;
         let result: Poll<io::Result<()>>;
 
-        if !me.read_overflow.is_empty() {
-            let to_read = min(buf.remaining(), me.read_overflow.len());
-            let piece = me.read_overflow.split_to(to_read);
-            buf.put_slice(&piece[..to_read]);
+        if me.read_offset < me.read_overflow.len() {
+            let to_read = min(buf.remaining(), me.read_overflow.len() - me.read_offset);
+            buf.put_slice(&me.read_overflow[me.read_offset..me.read_offset + to_read]);
+            me.read_offset += to_read;
+            if me.read_offset == me.read_overflow.len() {
+                me.read_overflow.clear();
+                me.read_offset = 0;
+            }
             consumed += to_read;
             result = Poll::Ready(Ok(()));
         } else {
@@ -257,7 +262,8 @@ impl AsyncRead for TcpStream {
                         consumed += to_read;
                         has_read_data = true;
                         if to_read < data.len() {
-                            me.read_overflow.extend_from_slice(&data[to_read..]);
+                            me.read_overflow = data;
+                            me.read_offset = to_read;
                             result = Poll::Ready(Ok(()));
                             break;
                         }
@@ -348,7 +354,7 @@ impl AsyncWrite for TcpStream {
         if self.callback_ctx.pcb_gone.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
-        let to_write = buf.len().min(self.send_buf_size());
+        let to_write = buf.len().min(self.send_buf_size()).min(u16::MAX as usize);
         if to_write == 0 {
             self.callback_ctx.write_waker.register(cx.waker());
             return Poll::Pending;

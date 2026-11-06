@@ -145,13 +145,16 @@
 #define MEMP_NUM_TCP_SEG 16384
 #endif
 #ifndef TCP_WND
-#define TCP_WND (32 * TCP_MSS)
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 3
+#define TCP_WND (256 * 1024)
 #endif
 #ifndef TCP_SND_BUF
-#define TCP_SND_BUF (16 * TCP_MSS)
+#define TCP_SND_BUF (256 * 1024)
+#define TCP_SNDLOWAT (4 * TCP_MSS)
 #endif
 #ifndef MEM_SIZE
-#define MEM_SIZE (8 * 1024 * 1024)
+#define MEM_SIZE (32 * 1024 * 1024)
 #endif
 // -----------------------------------------------------------------------------
 
@@ -177,7 +180,7 @@
 // is used regardless of the platform
 #define IPV6_FRAG_COPYHEADER 1
 
-#define LWIP_DEBUG 0
+/* Leave LWIP_DEBUG undefined: lwIP tests it with #ifdef, not #if. */
 #define LWIP_DBG_MIN_LEVEL LWIP_DBG_LEVEL_ALL
 #define LWIP_DBG_TYPES_ON LWIP_DBG_OFF
 #define NETIF_DEBUG LWIP_DBG_OFF

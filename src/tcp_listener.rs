@@ -65,22 +65,27 @@ impl TcpListener {
     pub(crate) fn new(stack: Arc<StackHandle>) -> Result<Pin<Box<Self>>, Error> {
         unsafe {
             let _g = LWIP_MUTEX.lock();
-            let mut tpcb = tcp_new();
+            let tpcb = tcp_new();
+            if tpcb.is_null() { return Err(Error::LwIP(err_enum_t_ERR_MEM as err_t)); }
             let err = tcp_bind(tpcb, &ip_addr_any_type, 0);
             if err != err_enum_t_ERR_OK as err_t {
                 error!("bind TCP failed: {}", err);
+                tcp_abort(tpcb);
                 return Err(Error::LwIP(err));
             }
             let mut reason: err_t = 0;
-            tpcb = tcp_listen_with_backlog_and_err(
+            let listening = tcp_listen_with_backlog_and_err(
                 tpcb,
                 TCP_DEFAULT_LISTEN_BACKLOG as u8,
                 &mut reason,
             );
-            if tpcb.is_null() {
+            if listening.is_null() {
                 error!("listen TCP failed: {}", reason);
+                // Failed listen leaves the original CLOSED PCB owned by the caller.
+                tcp_abort(tpcb);
                 return Err(Error::LwIP(reason));
             }
+            let tpcb = listening; // Successful listen consumed the original PCB.
             let (sender, receiver) = unbounded_channel();
             let ctx = Box::into_raw(Box::new(TcpListenerContext { sender, stack })) as usize;
             let listener = Box::pin(TcpListener {
