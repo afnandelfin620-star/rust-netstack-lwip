@@ -125,9 +125,13 @@ fn generate_lwip_bindings(out_path: &Path) {
 }
 
 fn main() {
-    // Generate bindings for the current target on every build (into OUT_DIR, not
-    // the source tree) so the ABI always matches the target being compiled for.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    generate_lwip_bindings(&out_path);
+    let pregenerated = Path::new("src/bindings.rs");
+    if env::var("BINDINGS_GEN").is_ok() || !pregenerated.exists() {
+        generate_lwip_bindings(&out_path);
+    } else {
+        std::fs::copy(pregenerated, out_path.join("bindings.rs"))
+            .expect("Couldn't copy pre-generated bindings.rs");
+    }
     compile_lwip();
 }
