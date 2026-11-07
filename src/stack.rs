@@ -125,7 +125,11 @@ impl NetStack {
             loop {
                 {
                     let _g = LWIP_MUTEX.lock();
+                    #[cfg(feature = "timer-diagnostics")]
+                    let measurement = crate::timer_diagnostics::Measurement::start();
                     unsafe { sys_check_timeouts() };
+                    #[cfg(feature = "timer-diagnostics")]
+                    measurement.finish();
                 }
                 tokio::time::sleep(time::Duration::from_millis(250)).await;
             }

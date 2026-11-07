@@ -22,3 +22,6 @@ pub enum Error {
     #[error("a NetStack instance is already running")]
     AlreadyRunning,
 }
+
+#[cfg(feature = "timer-diagnostics")]
+pub mod timer_diagnostics;
