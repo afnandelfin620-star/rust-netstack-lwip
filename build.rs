@@ -101,7 +101,13 @@ fn generate_lwip_bindings(out_path: &Path) {
     let target = env::var("TARGET").unwrap();
     let mut builder = bindgen::Builder::default()
         .header("src/wrapper.h")
-        .size_t_is_usize(false)
+        // Android libc uses pointer-sized size_t/ssize_t. Keep other targets'
+        // original mapping: lwIP's Windows ssize_t fallback can be 32-bit.
+        .size_t_is_usize(os == "android")
+        // These transitively included libc functions are unused by our bindings.
+        // Android headers may spell their sizes as unsigned long; avoid emitting
+        // duplicate runtime declarations that conflict with Rust's usize types.
+        .blocklist_function("^(malloc|realloc)$")
         .clang_arg("-I./src/lwip/include")
         .clang_arg("-I./src/lwip/custom")
         .clang_arg("-Wno-everything")
@@ -116,9 +122,10 @@ fn generate_lwip_bindings(out_path: &Path) {
             .filter_map(Result::ok).map(|e| e.path())
             .find(|p| p.join("include/stddef.h").exists())
             .expect("NDK clang builtin headers missing");
-        builder = builder.clang_arg(format!("-resource-dir={}", resource.display()));
+        builder = builder.clang_arg(format!("-isystem{}", resource.join("include").display()));
         builder = builder.clang_arg(format!("--sysroot={}", root.display()))
-            .clang_arg(format!("-I{}", root.join("usr/include").join(&target).display()));
+            .clang_arg(format!("-isystem{}", root.join("usr/include").display()))
+            .clang_arg(format!("-isystem{}", root.join("usr/include").join(&target).display()));
     }
     // Parse the headers with the actual target's ABI so struct layouts and
     // integer/pointer widths match the target rather than the build host.

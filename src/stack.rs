@@ -73,7 +73,7 @@ impl Drop for StackHandle {
 
 pub struct NetStack {
     rx: Receiver<Vec<u8>>,
-    sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
+    sink_buf: Option<bytes::Bytes>, // We're flushing per item, no need large buffer.
     // Timed backoff for retrying `poll_flush` when lwIP is out of pbuf memory.
     // lwIP gives no "memory freed" notification, so retry on a short timer
     // instead of self-waking, which would spin the executor at 100% CPU.
@@ -170,24 +170,17 @@ impl Stream for NetStack {
     }
 }
 
-impl Sink<Vec<u8>> for NetStack {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+impl NetStack {
+    fn poll_ready_internal(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let me = unsafe { self.get_unchecked_mut() };
         if me.sink_buf.is_none() {
             Poll::Ready(Ok(()))
         } else {
-            unsafe { Pin::new_unchecked(me) }.poll_flush(cx)
+            unsafe { Pin::new_unchecked(me) }.poll_flush_internal(cx)
         }
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
-        unsafe { self.get_unchecked_mut() }.sink_buf.replace(item);
-        Ok(())
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush_internal(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let me = unsafe { self.get_unchecked_mut() };
         let item = match me.sink_buf.take() {
             Some(item) => item,
@@ -252,6 +245,44 @@ impl Sink<Vec<u8>> for NetStack {
                 )))
             }
         }
+    }
+}
+
+impl Sink<bytes::Bytes> for NetStack {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_ready_internal(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: bytes::Bytes) -> Result<(), Self::Error> {
+        unsafe { self.get_unchecked_mut() }.sink_buf.replace(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush_internal(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Sink<Vec<u8>> for NetStack {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_ready_internal(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+        unsafe { self.get_unchecked_mut() }.sink_buf.replace(bytes::Bytes::from(item));
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush_internal(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
