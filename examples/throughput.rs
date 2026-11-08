@@ -296,6 +296,8 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
             Dir::Download => {
                 let buf = vec![0xA5u8; chunk];
                 let mut sent: u64 = 0;
+                let transfer = async {
+                let mut messages = 0;
                 while sent < total {
                     let n = ((total - sent) as usize).min(buf.len());
                     if std::env::var_os("NETSTACK_VECTORED").is_some() {
@@ -310,7 +312,13 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
                         }
                     } else { ns.write_all(&buf[..n]).await.expect("netstack write"); }
                     sent += n as u64;
+                    messages += 1;
+                    if messages % 32 == 0 { tokio::task::yield_now().await; }
                 }
+                };
+                if std::env::var_os("NETSTACK_BATCH_OUTPUT").is_some() {
+                    netstack_lwip::batch_tcp_output(transfer).await;
+                } else { transfer.await; }
                 ns.flush().await.ok();
                 ns.shutdown().await.ok();
             }
@@ -436,6 +444,9 @@ fn main() {
             // reuse a 4-tuple still lingering in TIME_WAIT from a prior run.
             let local_port = 49500 + i as u16;
             let report = run_direction(dir, bytes, chunk, local_port).await;
+            assert_eq!(report.bytes, bytes, "incomplete transfer");
+            #[cfg(feature = "datapath-diagnostics")]
+            eprintln!("datapath [write, output, tun packets, tun bytes]: {:?}", netstack_lwip::datapath_snapshot());
 
             assert_eq!(
                 report.bytes, bytes,

@@ -376,6 +376,8 @@ impl TcpStream {
                 let length = (buffer.len() - offset).min(self.send_buf_size())
                     .min(u16::MAX as usize).min(256 * 1024 - written);
                 if length == 0 { break 'batch; }
+                #[cfg(feature = "datapath-diagnostics")]
+                crate::output_batch::metrics::WRITE.fetch_add(1, Ordering::Relaxed);
                 let err = unsafe { tcp_write(self.pcb as *mut tcp_pcb,
                     buffer[offset..].as_ptr().cast(), length as u16, TCP_WRITE_FLAG_COPY as u8) };
                 if err != err_enum_t_ERR_OK as err_t {
@@ -390,7 +392,10 @@ impl TcpStream {
         }
         // Flush once per bounded batch, including before waiting for send credit.
         // Successfully queued bytes remain accepted even if output is transiently blocked.
-        unsafe { tcp_output(self.pcb as *mut tcp_pcb); }
+        if written == 0 || self.send_buf_size() == 0 || !crate::output_batch::defer(self.pcb, &self.callback_ctx) {
+            crate::output_batch::forget(&self.callback_ctx);
+            unsafe { crate::output_batch::output(self.pcb as *mut tcp_pcb); }
+        }
         if written > 0 { Poll::Ready(Ok(written)) }
         else { self.callback_ctx.write_waker.register(cx.waker()); Poll::Pending }
     }
@@ -414,7 +419,8 @@ impl AsyncWrite for TcpStream {
             // and acknowledged, so there is nothing left to flush.
             return Poll::Ready(Ok(()));
         }
-        let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
+        crate::output_batch::forget(&self.callback_ctx);
+        let err = unsafe { crate::output_batch::output(self.pcb as *mut tcp_pcb) };
         if err == err_enum_t_ERR_OK as err_t {
             Poll::Ready(Ok(()))
         } else if err == err_enum_t_ERR_MEM as err_t {
@@ -441,6 +447,8 @@ impl AsyncWrite for TcpStream {
             return Poll::Ready(Ok(()));
         }
         trace!("netstack tcp shutdown {}", &self.callback_ctx.local_addr);
+        crate::output_batch::forget(&self.callback_ctx);
+        unsafe { crate::output_batch::output(self.pcb as *mut tcp_pcb); }
         let err = unsafe { tcp_shutdown(self.pcb as *mut tcp_pcb, 0, 1) };
         if err == err_enum_t_ERR_MEM as err_t {
             self.callback_ctx.write_waker.register(cx.waker());

@@ -44,3 +44,8 @@ pub(crate) unsafe fn prepend_owned_pbuf(raw: usize, header: &[u8]) -> bool {
     std::ptr::copy_nonoverlapping(header.as_ptr(), payload.cast::<u8>(), header.len());
     true
 }
+
+mod output_batch;
+pub use output_batch::batch_tcp_output;
+#[cfg(feature = "datapath-diagnostics")]
+pub use output_batch::metrics::snapshot as datapath_snapshot;

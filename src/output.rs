@@ -55,7 +55,14 @@ fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
             OutputTarget::Direct { writer, errors, failed, stats } => {
                 if *failed { return err_enum_t_ERR_IF as err_t; }
                 match write_packet(p, writer.as_ref()) {
-                    Ok(()) => err_enum_t_ERR_OK as err_t,
+                    Ok(()) => {
+                        #[cfg(feature = "datapath-diagnostics")]
+                        {
+                            crate::output_batch::metrics::TUN_PACKETS.fetch_add(1, Ordering::Relaxed);
+                            crate::output_batch::metrics::TUN_BYTES.fetch_add(std::ptr::read_unaligned(p).tot_len as u64, Ordering::Relaxed);
+                        }
+                        err_enum_t_ERR_OK as err_t
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Already under LWIP_MUTEX: no extra atomics/locks or logs per packet.
                         stats.would_block_packets = stats.would_block_packets.saturating_add(1);
