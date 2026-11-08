@@ -363,55 +363,46 @@ impl Drop for TcpStream {
     }
 }
 
-impl AsyncWrite for TcpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+impl TcpStream {
+    fn poll_write_buffers(&self, cx: &mut Context<'_>, buffers: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
         let _guard = LWIP_MUTEX.lock();
-        // `pcb_gone` covers both cases that make writing impossible: an error
-        // (`errored` implies it) and a completed close.
-        if self.callback_ctx.pcb_gone.load(Ordering::Acquire) {
-            return Poll::Ready(Err(broken_pipe()));
-        }
-        let to_write = buf.len().min(self.send_buf_size()).min(u16::MAX as usize);
-        if to_write == 0 {
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
+        if self.callback_ctx.pcb_gone.load(Ordering::Acquire) { return Poll::Ready(Err(broken_pipe())); }
+        if buffers.iter().all(|b| b.is_empty()) { return Poll::Ready(Ok(0)); }
+        let mut written = 0;
+        let mut calls = 0;
+        'batch: for buffer in buffers {
+            let mut offset = 0;
+            while offset < buffer.len() && written < 256 * 1024 && calls < 64 {
+                let length = (buffer.len() - offset).min(self.send_buf_size())
+                    .min(u16::MAX as usize).min(256 * 1024 - written);
+                if length == 0 { break 'batch; }
+                let err = unsafe { tcp_write(self.pcb as *mut tcp_pcb,
+                    buffer[offset..].as_ptr().cast(), length as u16, TCP_WRITE_FLAG_COPY as u8) };
+                if err != err_enum_t_ERR_OK as err_t {
+                    if err != err_enum_t_ERR_MEM as err_t && written == 0 { return Poll::Ready(Err(broken_pipe())); }
+                    break 'batch;
+                }
+                written += length;
+                offset += length;
+                calls += 1;
             }
-            self.callback_ctx.write_waker.register(cx.waker());
-            return Poll::Pending;
+            if written == 256 * 1024 || calls == 64 { break; }
         }
-        let err = unsafe {
-            tcp_write(
-                self.pcb as *mut tcp_pcb,
-                buf.as_ptr() as *const raw::c_void,
-                to_write as u16_t,
-                TCP_WRITE_FLAG_COPY as u8,
-            )
-        };
-        if err == err_enum_t_ERR_OK as err_t {
-            // The bytes are now owned by lwIP (queued in `unsent`), so the write
-            // has succeeded regardless of whether we can flush them right now.
-            // tcp_output only *attempts* to send; a non-OK result here (usually
-            // ERR_MEM under memory pressure) is transient — lwIP flushes on the
-            // next timer tick, ACK, or poll_flush — so reporting it as a write
-            // failure would spuriously get an otherwise-healthy connection reset.
-            let out = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
-            if out != err_enum_t_ERR_OK as err_t {
-                trace!(
-                    "netstack tcp_output deferred ({}) on {}",
-                    out, self.callback_ctx.local_addr
-                );
-            }
-            Poll::Ready(Ok(to_write))
-        } else if err == err_enum_t_ERR_MEM as err_t {
-            // trace!("netstack tcp err_mem on {}", &local_addr);
-            self.callback_ctx.write_waker.register(cx.waker());
-            Poll::Pending
-        } else {
-            // Operation errors do not free the PCB. Drop must still detach
-            // callbacks and release it; only lwIP lifecycle callbacks mark it gone.
-            Poll::Ready(Err(broken_pipe()))
-        }
+        // Flush once per bounded batch, including before waiting for send credit.
+        // Successfully queued bytes remain accepted even if output is transiently blocked.
+        unsafe { tcp_output(self.pcb as *mut tcp_pcb); }
+        if written > 0 { Poll::Ready(Ok(written)) }
+        else { self.callback_ctx.write_waker.register(cx.waker()); Poll::Pending }
     }
+}
+impl AsyncWrite for TcpStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.poll_write_buffers(cx, &[io::IoSlice::new(buf)])
+    }
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        self.poll_write_buffers(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool { true }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let _guard = LWIP_MUTEX.lock();

@@ -10,7 +10,8 @@ mod util;
 
 pub(crate) static LWIP_MUTEX: mutex::LwipMutex = mutex::LwipMutex::new();
 
-pub use stack::{NetStack, StackInput, StackStream};
+pub use output::{direct_output_stats, DirectOutputStats};
+pub use stack::{DirectOutput, NetStack, StackInput, StackStream};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
 pub use udp::UdpSocket;
@@ -28,6 +29,9 @@ pub mod timer_diagnostics;
 
 /// Reserved ahead of TUN packets for the largest L5 UDP address header (279B).
 pub const TUN_HEADROOM: usize = 320;
+// Large-MTU experiment: largest aligned PBUF_RAM capacity, less headroom
+// and one spare byte to detect an over-MTU/truncated TUN read.
+pub const TUN_MTU: u16 = (65528 - TUN_HEADROOM - 1) as u16;
 
 // Caller owns the pbuf; mutation and the refcount check are serialized with lwIP.
 pub(crate) unsafe fn prepend_owned_pbuf(raw: usize, header: &[u8]) -> bool {

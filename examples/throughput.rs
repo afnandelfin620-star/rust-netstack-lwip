@@ -114,7 +114,6 @@ struct Report {
 
 async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> Report {
     let (stack, mut listener, _udp) = NetStack::new().expect("create netstack");
-    let (mut sink, mut stream) = stack.split();
 
     // lwIP output -> smoltcp RX
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -122,6 +121,27 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Wakes the smoltcp driver as soon as a packet arrives from lwIP.
     let wake = Arc::new(Notify::new());
+
+    // Optional validation of the production direct-output callback. This peer
+    // adapter copies only because smoltcp's in-memory device owns its input.
+    let direct_output = if std::env::var_os("NETSTACK_DIRECT_OUTPUT").is_some() {
+        let tx = in_tx.clone();
+        let notify = wake.clone();
+        let inject_drop = std::env::var_os("NETSTACK_DROP_ONCE").is_some();
+        let dropped = std::sync::atomic::AtomicBool::new(false);
+        Some(stack.direct_output(move |parts| {
+            let len: usize = parts.iter().map(|p| p.len()).sum();
+            if inject_drop && len > 100 && !dropped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let mut packet = Vec::with_capacity(len);
+            for part in parts { packet.extend_from_slice(part); }
+            tx.send(packet).map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+            notify.notify_one();
+            Ok(len)
+        }).unwrap())
+    } else { None };
+    let (mut sink, mut stream) = stack.split();
 
     // Pump: drain lwIP's outbound packets into the smoltcp device RX.
     let pump_in = {
@@ -158,7 +178,8 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
             let mut dev = ChanDevice {
                 rx: in_rx,
                 tx: out_tx,
-                mtu: 1500,
+                mtu: std::env::var("NETSTACK_PEER_MTU").ok()
+                    .map(|v| v.parse().expect("NETSTACK_PEER_MTU")).unwrap_or(1500),
             };
             let config = Config::new(HardwareAddress::Ip);
             let mut iface = Interface::new(config, &mut dev, SmolInstant::now());
@@ -207,6 +228,7 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
                                 match s.recv_slice(&mut recv_scratch) {
                                     Ok(0) | Err(_) => break,
                                     Ok(n) => {
+                                        assert!(recv_scratch[..n].iter().all(|b| *b == 0xA5), "download payload corruption");
                                         if start.is_none() {
                                             start = Some(Instant::now());
                                         }
@@ -276,7 +298,17 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
                 let mut sent: u64 = 0;
                 while sent < total {
                     let n = ((total - sent) as usize).min(buf.len());
-                    ns.write_all(&buf[..n]).await.expect("netstack write");
+                    if std::env::var_os("NETSTACK_VECTORED").is_some() {
+                        let middle = n / 2;
+                        let mut offset = 0;
+                        while offset < n {
+                            let first = if offset < middle { &buf[offset..middle] } else { &[] };
+                            let second = &buf[offset.max(middle)..n];
+                            let wrote = ns.write_vectored(&[std::io::IoSlice::new(first), std::io::IoSlice::new(second)]).await.unwrap();
+                            assert!(wrote > 0);
+                            offset += wrote;
+                        }
+                    } else { ns.write_all(&buf[..n]).await.expect("netstack write"); }
                     sent += n as u64;
                 }
                 ns.flush().await.ok();
@@ -289,6 +321,7 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
                     if n == 0 {
                         break; // EOF
                     }
+                    assert!(buf[..n].iter().all(|b| *b == 0x5A), "upload payload corruption");
                     if start.is_none() {
                         start = Some(Instant::now());
                     }
@@ -335,6 +368,7 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
     let _ = pump_out.await;
     // `listener` was moved into (and dropped by) the completed `app` task.
     drop(_udp);
+    drop(direct_output);
 
     report
 }

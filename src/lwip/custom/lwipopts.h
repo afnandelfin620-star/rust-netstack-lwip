@@ -95,7 +95,9 @@
 #define LWIP_CHECKSUM_ON_COPY 1
 #define LWIP_CHKSUM_ALGORITHM 3
 
-#define TCP_MSS 1460
+// Large-MTU experiment: keep TCP_SNDLOWAT=4*MSS and the existing
+// TCP_SNDLOWAT < 65535-4*MSS sanity check. 8191 is the largest valid MSS.
+#define TCP_MSS 8191
 
 // TIME_WAIT lasts 2*TCP_MSL. The default MSL (60s) makes closed connections
 // linger 120s, holding a tcp_pcb each; under connection churn (a VPN carries

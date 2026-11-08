@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use super::lwip::*;
-use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
+use super::output::{output_ip4, output_ip6, OutputTarget, OUTPUT_CB_PTR};
 use super::tcp_listener::TcpListener;
 use super::udp::UdpSocket;
 use super::LWIP_MUTEX;
@@ -26,18 +26,18 @@ static LWIP_INIT: Once = Once::new();
 static NETSTACK_ALIVE: AtomicBool = AtomicBool::new(false);
 
 /// Shared, reference-counted owner of the process-global lwIP stack state: the
-/// timer task, the output-callback `Sender`, and the `NETSTACK_ALIVE` guard.
+/// timer task, the output-callback target, and the `NETSTACK_ALIVE` guard.
 ///
 /// `NetStack`, `TcpListener`, `UdpSocket` (and every `TcpStream`/`SendHalf`
 /// derived from them) each hold an `Arc<StackHandle>`, so teardown — aborting
-/// the timer, clearing `OUTPUT_CB_PTR`, freeing the `Sender`, and releasing the
+/// the timer, clearing `OUTPUT_CB_PTR`, freeing the output target, and releasing the
 /// singleton guard — happens only when the *last* handle is dropped, regardless
 /// of the order the user drops them in. This removes the footgun where dropping
 /// `NetStack` first would silently stop driving lwIP for still-live listeners
 /// and streams (or let a second `NetStack` repoint the global callback).
 pub(crate) struct StackHandle {
     // Raw pointer (kept as usize so `StackHandle` stays `Send`) to a
-    // heap-allocated `Sender` used only by the lwIP output callback. Owned here
+    // heap-allocated `OutputTarget` used only by the lwIP output callback. Owned here
     // and freed on drop. Deliberately separate from `NetStack::rx` so the
     // callback never has to form a reference to `NetStack`, which would alias
     // the `&mut` taken in `poll_next` and be undefined behaviour.
@@ -56,15 +56,15 @@ impl Drop for StackHandle {
         self.timer.abort();
         {
             let _g = LWIP_MUTEX.lock();
-            // Only clear the global if it still points at our Sender: a later
+            // Only clear the global if it still points at our target: a later
             // NetStack may have overwritten it.
             if OUTPUT_CB_PTR.load(Ordering::Acquire) == self.output_tx {
                 OUTPUT_CB_PTR.store(0, Ordering::Release);
             }
-            // Reclaim the callback Sender. Safe under the lock: the output
+            // Reclaim the callback target. Safe under the lock: the output
             // callback only runs while LWIP_MUTEX is held, so it cannot be
             // reading this pointer concurrently, and it will no longer see it.
-            unsafe { drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>)) };
+            unsafe { drop(Box::from_raw(self.output_tx as *mut OutputTarget)) };
         }
         // Allow a new NetStack to be created now that this one is gone.
         NETSTACK_ALIVE.store(false, Ordering::Release);
@@ -114,12 +114,13 @@ impl NetStack {
             unsafe {
                 (*netif_list).output = Some(output_ip4);
                 (*netif_list).output_ip6 = Some(output_ip6);
-                (*netif_list).mtu = 1500;
+                (*netif_list).mtu = crate::TUN_MTU;
+                (*netif_list).mtu6 = crate::TUN_MTU;
             }
         }
 
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel(buffer_size);
-        let output_tx = Box::into_raw(Box::new(tx)) as usize;
+        let output_tx = Box::into_raw(Box::new(OutputTarget::Channel(tx))) as usize;
 
         let timer = tokio::spawn(async move {
             loop {
@@ -153,6 +154,40 @@ impl NetStack {
         Ok((stack, handle))
     }
 
+}
+
+/// Keeps the callback alive and disables output before releasing its resources.
+pub struct DirectOutput { stack: Arc<StackHandle>, errors: tokio::sync::watch::Receiver<Option<io::ErrorKind>> }
+impl DirectOutput {
+    pub async fn wait_error(&mut self) -> io::Error {
+        loop {
+            if let Some(kind) = *self.errors.borrow_and_update() { return io::Error::new(kind, "direct TUN output failed"); }
+            if self.errors.changed().await.is_err() { return io::ErrorKind::BrokenPipe.into(); }
+        }
+    }
+}
+impl Drop for DirectOutput {
+    fn drop(&mut self) {
+        let _lock = LWIP_MUTEX.lock();
+        unsafe { *(self.stack.output_tx as *mut OutputTarget) = OutputTarget::Disabled; }
+    }
+}
+impl NetStack {
+    /// Writer must be nonblocking and must not call back into lwIP or panic.
+    /// The callback borrows each packet only until this function returns.
+    pub fn direct_output<F>(&self, writer: F) -> io::Result<DirectOutput>
+    where F: Fn(&[io::IoSlice<'_>]) -> io::Result<usize> + Send + Sync + 'static {
+        let _lock = LWIP_MUTEX.lock();
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        unsafe {
+            let target = &mut *(self._stack.output_tx as *mut OutputTarget);
+            if matches!(target, OutputTarget::Direct { .. }) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "direct output already registered"));
+            }
+            *target = OutputTarget::Direct { writer: Box::new(writer), errors: tx, failed: false, stats: Default::default() };
+        }
+        Ok(DirectOutput { stack: self._stack.clone(), errors: rx })
+    }
 }
 
 pub struct StackInput { _stack: Arc<StackHandle> }
@@ -353,6 +388,34 @@ mod error_lifecycle_tests {
             let (_stack, handle) = NetStack::_new(32).unwrap();
             crate::udp::verify_owned_datagrams(handle.clone()).await;
             let mut input = StackInput { _stack: handle.clone() };
+            // Exercise the actual largest packet through the TUN ingestion API,
+            // including reserved headroom, IPv4 and UDP length fields.
+            {
+                let udp = UdpSocket::new(4, handle.clone()).unwrap();
+                let (_sender, mut receiver) = udp.split();
+                let size = crate::TUN_MTU as usize;
+                let mut wire = vec![0x5a; size];
+                wire[..28].fill(0);
+                wire[0] = 0x45;
+                wire[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                wire[8] = 64; wire[9] = 17;
+                wire[12..16].copy_from_slice(&[10,0,0,2]);
+                wire[16..20].copy_from_slice(&[10,0,0,1]);
+                wire[20..22].copy_from_slice(&12345u16.to_be_bytes());
+                wire[22..24].copy_from_slice(&443u16.to_be_bytes());
+                wire[24..26].copy_from_slice(&((size - 20) as u16).to_be_bytes());
+                unsafe {
+                    assert_eq!(input.ingest_packet_with(size + 1, |buf| {
+                        for (dst, src) in buf.iter_mut().zip(&wire) { dst.write(*src); }
+                        Ok(size)
+                    }).unwrap(), size);
+                }
+                let (payload, src, dst) = tokio::time::timeout(time::Duration::from_secs(1), receiver.recv_from()).await.unwrap().unwrap();
+                assert_eq!((src.port(), dst.port()), (12345, 443));
+                assert_eq!(payload.len(), size - 28);
+                assert!(payload.iter().all(|b| *b == 0x5a));
+            }
+
             unsafe {
                 for capacity in [0, 65209, 65528, 65535, 65536, usize::MAX] {
                     assert_eq!(input.ingest_packet_with(capacity, |_| panic!("must not read"))
@@ -542,6 +605,7 @@ mod error_lifecycle_tests {
                     assert_eq!(result, err_enum_t_ERR_OK as err_t, "old PCB leaked its port");
                 } }
             }
+            crate::output::verify_direct_output(&_stack).await;
         });
     }
 }
