@@ -155,6 +155,53 @@ impl NetStack {
 
 }
 
+pub struct StackInput { _stack: Arc<StackHandle> }
+pub type StackStream = Pin<Box<NetStack>>;
+impl NetStack {
+    pub fn split_io(self: Pin<Box<Self>>) -> (StackInput, StackStream) {
+        (StackInput { _stack: self._stack.clone() }, self)
+    }
+}
+// Must be dropped under LWIP_MUTEX, unless ownership passes to netif input.
+struct OwnedInputPbuf(*mut pbuf);
+impl Drop for OwnedInputPbuf {
+    fn drop(&mut self) { unsafe { pbuf_free(self.0); } }
+}
+impl StackInput {
+    /// Read into contiguous PBUF_RAM; callback must be nonblocking and not re-enter lwIP.
+    /// # Safety
+    /// On Ok(n), the callback must have initialized the first n bytes.
+    pub unsafe fn ingest_packet_with<F>(&mut self, capacity: usize, read: F) -> io::Result<usize>
+    where F: FnOnce(&mut [std::mem::MaybeUninit<u8>]) -> io::Result<usize> {
+        // PBUF_RAM rounds payload length up inside a u16. Leave room for
+        // the largest MEM_ALIGNMENT (8) used by our supported targets.
+        let capacity = u16::try_from(capacity).ok().filter(|n| *n != 0 && *n <= 65528)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pbuf capacity"))?;
+        let _lock = LWIP_MUTEX.lock();
+        let raw = pbuf_alloc(pbuf_layer_PBUF_RAW, capacity, pbuf_type_PBUF_RAM);
+        if raw.is_null() {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "pbuf allocation failed"));
+        }
+        let owned = OwnedInputPbuf(raw);
+        let storage = std::slice::from_raw_parts_mut(
+            std::ptr::addr_of!((*raw).payload).read_unaligned().cast::<std::mem::MaybeUninit<u8>>(), capacity as usize);
+        let n = read(storage)?;
+        if n > capacity as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "read exceeded pbuf capacity"));
+        }
+        if n == 0 { return Ok(0); }
+        pbuf_realloc(raw, n as u16);
+        let input = (*netif_list).input.ok_or_else(||
+            io::Error::new(io::ErrorKind::NotConnected, "netif input missing"))?;
+        let err = input(raw, netif_list);
+        if err != err_enum_t_ERR_OK as err_t {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("netif input failed: {err}")));
+        }
+        std::mem::forget(owned);
+        Ok(n)
+    }
+}
+
 impl Stream for NetStack {
     type Item = io::Result<Vec<u8>>;
 
@@ -301,6 +348,98 @@ mod error_lifecycle_tests {
     fn failed_write_and_shutdown_preserve_pcb_cleanup_and_eof() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let (_stack, handle) = NetStack::_new(32).unwrap();
+            let mut input = StackInput { _stack: handle.clone() };
+            unsafe {
+                for capacity in [0, 65529, 65535, 65536, usize::MAX] {
+                    assert_eq!(input.ingest_packet_with(capacity, |_| panic!("must not read"))
+                        .unwrap_err().kind(), io::ErrorKind::InvalidInput);
+                }
+                // More allocations than the 32 MiB heap can hold if cleanup leaks.
+                for _ in 0..600 {
+                    assert_eq!(input.ingest_packet_with(65528, |_| Err(io::ErrorKind::WouldBlock.into()))
+                        .unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                }
+                assert_eq!(input.ingest_packet_with(64, |_| Ok(65)).unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_eq!(input.ingest_packet_with(64, |_| Ok(0)).unwrap(), 0);
+                let mut held = Vec::new();
+                {
+                    let _lock = LWIP_MUTEX.lock();
+                    loop {
+                        let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 2048, pbuf_type_PBUF_RAM);
+                        if p.is_null() { break; }
+                        held.push(p);
+                    }
+                }
+                assert_eq!(input.ingest_packet_with(2048, |_| panic!("OOM must not consume input"))
+                    .unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+                {
+                    let _lock = LWIP_MUTEX.lock();
+                    for p in held { pbuf_free(p); }
+                }
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = input.ingest_packet_with(65528, |_| panic!("reader panic"));
+                }));
+                assert!(panic.is_err());
+                // Invalid IP version is deliberately discarded by lwIP, which owns/free it.
+                for _ in 0..600 {
+                    assert_eq!(input.ingest_packet_with(65528, |buf| {
+                        for byte in &mut buf[..40] { byte.write(0); }
+                        Ok(40)
+                    }).unwrap(), 40);
+                }
+            }
+            // Receive chained pbufs without an intermediate payload Vec. A small
+            // read preserves the tail; the following large read batches packets.
+            {
+                let mut stream = {
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        let pcb = tcp_new();
+                        let stream = TcpStream::new(pcb, handle.clone());
+                        for pair in [(b"abc".as_slice(), b"def".as_slice()), (b"ghi".as_slice(), b"jkl".as_slice())] {
+                            let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 3, pbuf_type_PBUF_RAM);
+                            let q = pbuf_alloc(pbuf_layer_PBUF_RAW, 3, pbuf_type_PBUF_RAM);
+                            assert!(!p.is_null() && !q.is_null());
+                            pbuf_take(p, pair.0.as_ptr().cast(), 3);
+                            pbuf_take(q, pair.1.as_ptr().cast(), 3);
+                            pbuf_cat(p, q);
+                            assert_eq!(tcp_recv_cb((*pcb).callback_arg, pcb, p, 0), 0);
+                        }
+                        tcp_recv_cb((*pcb).callback_arg, pcb, std::ptr::null_mut(), 0);
+                        stream
+                    }
+                };
+                let mut first = [0;2];
+                stream.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first, b"ab");
+                let mut rest = [0;32];
+                let n = stream.read(&mut rest).await.unwrap();
+                assert_eq!(&rest[..n], b"cdefghijkl");
+                assert_eq!(stream.read(&mut rest).await.unwrap(), 0);
+            }
+            // Cancellation with one partly-read chain and another queued chain
+            // must reclaim both, without crediting a detached/freed PCB.
+            for _ in 0..600 {
+                let mut stream = {
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        let pcb = tcp_new();
+                        let stream = TcpStream::new(pcb, handle.clone());
+                        for _ in 0..2 {
+                            let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 32768, pbuf_type_PBUF_RAM);
+                            assert!(!p.is_null(), "cancelled receive leaked pbufs");
+                            let payload = std::ptr::addr_of!((*p).payload).read_unaligned();
+                            std::ptr::write_bytes(payload.cast::<u8>(), 0x5a, 32768);
+                            tcp_recv_cb((*pcb).callback_arg, pcb, p, 0);
+                        }
+                        stream
+                    }
+                };
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte, [0x5a]);
+                drop(stream);
+            }
             for shutdown in [false, true] {
                 let pcb = {
                     let _lock = LWIP_MUTEX.lock();

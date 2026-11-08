@@ -58,20 +58,12 @@ pub unsafe extern "C" fn tcp_recv_cb(
             // woken again (the sent/poll callbacks are detached now).
             ctx.write_waker.wake();
         }
-        let _ = ctx.read_tx.send(Vec::new());
+        let _ = ctx.read_tx.send(0);
         return err_enum_t_ERR_OK as err_t;
     }
 
-    let pbuflen = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(pbuflen as usize);
-    pbuf_copy_partial(p, buf.as_mut_ptr() as _, pbuflen, 0);
-    buf.set_len(pbuflen as usize);
-
-    if !buf.is_empty() {
-        let _ = ctx.read_tx.send(buf);
-    }
-
-    pbuf_free(p);
+    // Transfer ownership, not payload bytes. No window credit until consumed.
+    if ctx.read_tx.send(p as usize).is_err() { pbuf_free(p); }
     err_enum_t_ERR_OK as err_t
 }
 
@@ -102,8 +94,8 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     if err != err_enum_t_ERR_CLSD as err_t {
         ctx.errored.store(true, Ordering::Release);
     }
-    // Wake a parked reader via an empty-vec sentinel and a parked writer.
-    let _ = ctx.read_tx.send(Vec::new());
+    // Wake a parked reader via a zero-pointer sentinel and a parked writer.
+    let _ = ctx.read_tx.send(0);
     ctx.write_waker.wake();
 }
 
@@ -122,13 +114,12 @@ pub struct TcpStream {
     src_addr: SocketAddr,
     dest_addr: SocketAddr,
     pcb: usize,
-    // Overflow buffer for read data that didn't fit the caller's buffer.
-    read_overflow: Vec<u8>,
-    read_offset: usize,
-    callback_ctx: TcpStreamContext,
+    // Own the received chain until copied into the caller's reusable buffer.
+    read_current: Option<ReceivedPbuf>,
+    callback_ctx: Arc<TcpStreamContext>,
     // Receiving end of the channel fed by `tcp_recv_cb`; owned solely by the
     // async side, so it needs no sharing/locking.
-    read_rx: UnboundedReceiver<Vec<u8>>,
+    read_rx: UnboundedReceiver<usize>,
     is_eof: bool,
     // Keeps the shared lwIP stack alive for as long as this connection exists,
     // so the timer keeps driving it even if the netstack/listener are dropped.
@@ -154,15 +145,14 @@ impl TcpStream {
                 src_addr,
                 dest_addr,
                 pcb: pcb as usize,
-                read_overflow: Vec::new(),
-                read_offset: 0,
-                callback_ctx: TcpStreamContext::new(src_addr, read_tx),
+                read_current: None,
+                callback_ctx: Arc::new(TcpStreamContext::new(src_addr, read_tx)),
                 read_rx,
                 is_eof: false,
                 _stack: stack,
                 _pin: PhantomPinned::default(),
             });
-            let arg = &stream.callback_ctx as *const _;
+            let arg = Arc::as_ptr(&stream.callback_ctx);
             tcp_arg(pcb, arg as *mut raw::c_void);
             tcp_recv(pcb, Some(tcp_recv_cb));
             tcp_sent(pcb, Some(tcp_sent_cb));
@@ -208,108 +198,75 @@ fn broken_pipe() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")
 }
 
+// The receive callback relinquishes the entire pbuf chain. lwIP no longer
+// mutates it. Keep stack/flags alive until this chain is consumed or dropped.
+struct ReceivedPbuf {
+    root: usize,
+    node: usize,
+    offset: usize,
+    pcb: usize,
+    length: u16,
+    ctx: Arc<TcpStreamContext>,
+    _stack: Arc<StackHandle>,
+}
+impl Drop for ReceivedPbuf {
+    fn drop(&mut self) {
+        let _lock = LWIP_MUTEX.lock();
+        unsafe {
+            pbuf_free(self.root as *mut pbuf);
+            if !self.ctx.pcb_gone.load(Ordering::Acquire) {
+                tcp_recved(self.pcb as *mut tcp_pcb, self.length);
+            }
+        }
+    }
+}
 impl AsyncRead for TcpStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut ReadBuf,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let me = unsafe { self.get_unchecked_mut() };
-        // `errored` is atomic and the channel/overflow are touched only by this
-        // async side, so the whole drain runs WITHOUT LWIP_MUTEX. Only the
-        // window update (tcp_recved) needs lwIP, so we take the lock once at the
-        // end for the total bytes consumed — turning "lock held for the entire
-        // read" into "lock held for one window update", which is what lets many
-        // connections' reads interleave instead of serialising on the drain.
-        if me.callback_ctx.errored.load(Ordering::Acquire) {
-            return Poll::Ready(Err(broken_pipe()));
-        }
-
-        let mut consumed: usize = 0;
-        let result: Poll<io::Result<()>>;
-
-        if me.read_offset < me.read_overflow.len() {
-            let to_read = min(buf.remaining(), me.read_overflow.len() - me.read_offset);
-            buf.put_slice(&me.read_overflow[me.read_offset..me.read_offset + to_read]);
-            me.read_offset += to_read;
-            if me.read_offset == me.read_overflow.len() {
-                me.read_overflow.clear();
-                me.read_offset = 0;
+        if buf.remaining() == 0 { return Poll::Ready(Ok(())); }
+        if me.callback_ctx.errored.load(Ordering::Acquire) { return Poll::Ready(Err(broken_pipe())); }
+        let initial = buf.filled().len();
+        loop {
+            if let Some(packet) = me.read_current.as_mut() {
+                while packet.node != 0 && buf.remaining() > 0 {
+                    // Exclusive payload ownership passed from the receive callback;
+                    // lwIP no longer modifies it. No lwIP lock is held while copying.
+                    let node = unsafe { std::ptr::read_unaligned(packet.node as *const pbuf) };
+                    let count = min(buf.remaining(), node.len as usize - packet.offset);
+                    let data = unsafe { std::slice::from_raw_parts(
+                        (node.payload as *const u8).add(packet.offset), count) };
+                    buf.put_slice(data);
+                    packet.offset += count;
+                    if packet.offset == node.len as usize {
+                        packet.node = node.next as usize;
+                        packet.offset = 0;
+                    }
+                }
+                if packet.node == 0 { me.read_current = None; }
+                if buf.remaining() == 0 { return Poll::Ready(Ok(())); }
             }
-            consumed += to_read;
-            result = Poll::Ready(Ok(()));
-        } else {
-            if me.is_eof {
-                return Poll::Ready(Ok(()));
-            }
-            let mut has_read_data = false;
-            loop {
-                match Pin::new(&mut me.read_rx).poll_recv(cx) {
-                    Poll::Ready(Some(data)) => {
-                        // An empty vec is a sentinel: EOF, or a broken pipe if
-                        // the error callback fired.
-                        if data.is_empty() {
-                            if me.callback_ctx.errored.load(Ordering::Acquire) {
-                                result = Poll::Ready(Err(broken_pipe()));
-                            } else {
-                                me.is_eof = true;
-                                result = Poll::Ready(Ok(()));
-                            }
-                            break;
-                        }
-                        let to_read = min(buf.remaining(), data.len());
-                        buf.put_slice(&data[..to_read]);
-                        // Count only bytes actually handed to the caller, so the
-                        // announced window reflects real consumption. Any
-                        // remainder is stashed and counted when later drained.
-                        consumed += to_read;
-                        has_read_data = true;
-                        if to_read < data.len() {
-                            me.read_overflow = data;
-                            me.read_offset = to_read;
-                            result = Poll::Ready(Ok(()));
-                            break;
-                        }
-                        if buf.remaining() == 0 {
-                            result = Poll::Ready(Ok(()));
-                            break;
-                        }
-                    }
-                    Poll::Ready(None) => {
-                        result = Poll::Ready(Err(broken_pipe()));
-                        break;
-                    }
-                    Poll::Pending => {
-                        result = if has_read_data {
-                            Poll::Ready(Ok(()))
-                        } else {
-                            Poll::Pending
-                        };
-                        break;
-                    }
+            if me.is_eof { return Poll::Ready(Ok(())); }
+            match me.read_rx.poll_recv(cx) {
+                Poll::Pending => return if buf.filled().len() > initial {
+                    Poll::Ready(Ok(()))
+                } else { Poll::Pending },
+                Poll::Ready(None) => return if buf.filled().len() > initial {
+                    Poll::Ready(Ok(()))
+                } else { Poll::Ready(Err(broken_pipe())) },
+                Poll::Ready(Some(0)) => {
+                    me.is_eof = true;
+                    return if me.callback_ctx.errored.load(Ordering::Acquire) && buf.filled().len() == initial {
+                        Poll::Ready(Err(broken_pipe()))
+                    } else { Poll::Ready(Ok(())) };
+                }
+                Poll::Ready(Some(raw)) => {
+                    let root = unsafe { std::ptr::read_unaligned(raw as *const pbuf) };
+                    me.read_current = Some(ReceivedPbuf { root: raw, node: raw, offset: 0,
+                        pcb: me.pcb, length: root.tot_len, ctx: me.callback_ctx.clone(),
+                        _stack: me._stack.clone() });
                 }
             }
         }
-
-        if consumed > 0 {
-            let _guard = LWIP_MUTEX.lock();
-            // Re-check under the lock: during the lockless drain a callback
-            // (which runs under LWIP_MUTEX) may have marked the pcb gone —
-            // errored, gracefully closed, or parked in TIME_WAIT — and lwIP may
-            // have freed it, so calling tcp_recved would be use-after-free.
-            if !me.callback_ctx.pcb_gone.load(Ordering::Acquire) {
-                // tcp_recved takes a u16, but a single read can consume more
-                // than 65535 bytes (e.g. a 64 KiB buffer), so advance the window
-                // in u16-sized chunks rather than truncating.
-                let mut remaining = consumed;
-                while remaining > 0 {
-                    let chunk = remaining.min(u16::MAX as usize);
-                    unsafe { tcp_recved(me.pcb as *mut tcp_pcb, chunk as u16_t) };
-                    remaining -= chunk;
-                }
-            }
-        }
-        result
     }
 }
 
@@ -317,6 +274,11 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         let _guard = LWIP_MUTEX.lock();
         trace!("netstack tcp drop {}", &self.callback_ctx.local_addr);
+        self.read_rx.close();
+        while let Ok(raw) = self.read_rx.try_recv() {
+            if raw != 0 { unsafe { pbuf_free(raw as *mut pbuf); } }
+        }
+
         // If the pcb is gone (errored, close handshake completed, or parked in
         // TIME_WAIT for lwIP to reclaim), the callbacks are already detached
         // and the pcb may already be freed — don't touch it.
@@ -346,6 +308,8 @@ impl Drop for TcpStream {
                 }
             }
         }
+        // Any outstanding owned chunks must not credit this PCB after teardown.
+        self.callback_ctx.pcb_gone.store(true, Ordering::Release);
     }
 }
 

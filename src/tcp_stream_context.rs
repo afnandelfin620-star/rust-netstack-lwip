@@ -17,9 +17,9 @@ use tokio::sync::mpsc::UnboundedSender;
 pub struct TcpStreamContext {
     /// Peer address, kept only for logging.
     pub local_addr: SocketAddr,
-    /// Carries received data — and an empty-vec sentinel on EOF/error — to
+    /// Carries received pbuf ownership — and a zero-pointer sentinel on EOF/error — to
     /// `TcpStream::poll_read`. `send` needs only `&self`.
-    pub read_tx: UnboundedSender<Vec<u8>>,
+    pub read_tx: UnboundedSender<usize>,
     /// The connection failed (reset/aborted). Reported to the user as an
     /// error. Implies `pcb_gone`.
     pub errored: AtomicBool,
@@ -38,7 +38,7 @@ pub struct TcpStreamContext {
 }
 
 impl TcpStreamContext {
-    pub fn new(local_addr: SocketAddr, read_tx: UnboundedSender<Vec<u8>>) -> Self {
+    pub fn new(local_addr: SocketAddr, read_tx: UnboundedSender<usize>) -> Self {
         TcpStreamContext {
             local_addr,
             read_tx,

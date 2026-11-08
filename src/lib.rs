@@ -10,7 +10,7 @@ mod util;
 
 pub(crate) static LWIP_MUTEX: mutex::LwipMutex = mutex::LwipMutex::new();
 
-pub use stack::NetStack;
+pub use stack::{NetStack, StackInput, StackStream};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
 pub use udp::UdpSocket;
