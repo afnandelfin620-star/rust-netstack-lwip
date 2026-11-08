@@ -175,14 +175,17 @@ impl StackInput {
     where F: FnOnce(&mut [std::mem::MaybeUninit<u8>]) -> io::Result<usize> {
         // PBUF_RAM rounds payload length up inside a u16. Leave room for
         // the largest MEM_ALIGNMENT (8) used by our supported targets.
-        let capacity = u16::try_from(capacity).ok().filter(|n| *n != 0 && *n <= 65528)
+        let capacity = u16::try_from(capacity).ok().filter(|n| *n != 0 && *n as usize <= 65528 - crate::TUN_HEADROOM)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pbuf capacity"))?;
         let _lock = LWIP_MUTEX.lock();
-        let raw = pbuf_alloc(pbuf_layer_PBUF_RAW, capacity, pbuf_type_PBUF_RAM);
+        let raw = pbuf_alloc(pbuf_layer_PBUF_RAW, capacity + crate::TUN_HEADROOM as u16, pbuf_type_PBUF_RAM);
         if raw.is_null() {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "pbuf allocation failed"));
         }
         let owned = OwnedInputPbuf(raw);
+        if pbuf_remove_header(raw, crate::TUN_HEADROOM as _) != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pbuf headroom reservation failed"));
+        }
         let storage = std::slice::from_raw_parts_mut(
             std::ptr::addr_of!((*raw).payload).read_unaligned().cast::<std::mem::MaybeUninit<u8>>(), capacity as usize);
         let n = read(storage)?;
@@ -348,15 +351,16 @@ mod error_lifecycle_tests {
     fn failed_write_and_shutdown_preserve_pcb_cleanup_and_eof() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let (_stack, handle) = NetStack::_new(32).unwrap();
+            crate::udp::verify_owned_datagrams(handle.clone()).await;
             let mut input = StackInput { _stack: handle.clone() };
             unsafe {
-                for capacity in [0, 65529, 65535, 65536, usize::MAX] {
+                for capacity in [0, 65209, 65528, 65535, 65536, usize::MAX] {
                     assert_eq!(input.ingest_packet_with(capacity, |_| panic!("must not read"))
                         .unwrap_err().kind(), io::ErrorKind::InvalidInput);
                 }
                 // More allocations than the 32 MiB heap can hold if cleanup leaks.
                 for _ in 0..600 {
-                    assert_eq!(input.ingest_packet_with(65528, |_| Err(io::ErrorKind::WouldBlock.into()))
+                    assert_eq!(input.ingest_packet_with(65208, |_| Err(io::ErrorKind::WouldBlock.into()))
                         .unwrap_err().kind(), io::ErrorKind::WouldBlock);
                 }
                 assert_eq!(input.ingest_packet_with(64, |_| Ok(65)).unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -377,12 +381,12 @@ mod error_lifecycle_tests {
                     for p in held { pbuf_free(p); }
                 }
                 let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = input.ingest_packet_with(65528, |_| panic!("reader panic"));
+                    let _ = input.ingest_packet_with(65208, |_| panic!("reader panic"));
                 }));
                 assert!(panic.is_err());
                 // Invalid IP version is deliberately discarded by lwIP, which owns/free it.
                 for _ in 0..600 {
-                    assert_eq!(input.ingest_packet_with(65528, |buf| {
+                    assert_eq!(input.ingest_packet_with(65208, |buf| {
                         for byte in &mut buf[..40] { byte.write(0); }
                         Ok(40)
                     }).unwrap(), 40);
@@ -416,6 +420,67 @@ mod error_lifecycle_tests {
                 let n = stream.read(&mut rest).await.unwrap();
                 assert_eq!(&rest[..n], b"cdefghijkl");
                 assert_eq!(stream.read(&mut rest).await.unwrap(), 0);
+            }
+            // Remote framing must prepend in place and retain the original
+            // receive-window credit until the last Bytes reference is released.
+            for shared in [false, true] {
+                let (mut stream, pcb, raw, address) = {
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        let pcb = tcp_new();
+                        let stream = TcpStream::new(pcb, handle.clone());
+                        let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 323, pbuf_type_PBUF_RAM);
+                        assert!(!p.is_null());
+                        pbuf_remove_header(p, 320);
+                        pbuf_take(p, b"abc".as_ptr().cast(), 3);
+                        let address = std::ptr::addr_of!((*p).payload).read_unaligned() as usize;
+                        if shared { pbuf_ref(p); }
+                        std::ptr::addr_of_mut!((*pcb).rcv_wnd).write_unaligned(1000);
+                        tcp_recv_cb((*pcb).callback_arg, pcb, p, 0);
+                        (stream, pcb, p, address)
+                    }
+                };
+                let frame = futures::future::poll_fn(|cx| stream.as_mut().poll_read_frame(cx, b"HEAD")).await.unwrap();
+                assert_eq!(&frame[..], b"HEADabc");
+                if !shared {
+                    assert_eq!(frame[4..].as_ptr() as usize, address);
+                    { let _lock = LWIP_MUTEX.lock(); unsafe {
+                        assert_eq!(std::ptr::addr_of!((*pcb).rcv_wnd).read_unaligned(), 1000);
+                    } }
+                } else {
+                    assert_ne!(frame[4..].as_ptr() as usize, address);
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        assert_eq!(std::ptr::read_unaligned(raw).len, 3);
+                        pbuf_free(raw);
+                    }
+                }
+                let copy = frame.clone(); drop(frame);
+                drop(copy);
+                { let _lock = LWIP_MUTEX.lock(); unsafe {
+                    assert_eq!(std::ptr::addr_of!((*pcb).rcv_wnd).read_unaligned(), 1003);
+                } }
+                drop(stream);
+            }
+            // A frame queued to WebSocket can outlive the connection or be
+            // cancelled. Its destructor must not touch the freed PCB.
+            for _ in 0..600 {
+                let mut stream = {
+                    let _lock = LWIP_MUTEX.lock();
+                    unsafe {
+                        let pcb = tcp_new();
+                        let stream = TcpStream::new(pcb, handle.clone());
+                        let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 323, pbuf_type_PBUF_RAM);
+                        pbuf_remove_header(p, 320);
+                        pbuf_take(p, b"abc".as_ptr().cast(), 3);
+                        tcp_recv_cb((*pcb).callback_arg, pcb, p, 0);
+                        stream
+                    }
+                };
+                let frame = futures::future::poll_fn(|cx| stream.as_mut().poll_read_frame(cx, b"HEAD")).await.unwrap();
+                drop(stream);
+                assert_eq!(&frame[..], b"HEADabc");
+                drop(frame);
             }
             // Cancellation with one partly-read chain and another queued chain
             // must reclaim both, without crediting a detached/freed PCB.

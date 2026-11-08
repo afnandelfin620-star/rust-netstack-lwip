@@ -220,6 +220,56 @@ impl Drop for ReceivedPbuf {
         }
     }
 }
+impl AsRef<[u8]> for ReceivedPbuf {
+    fn as_ref(&self) -> &[u8] {
+        let value = unsafe { std::ptr::read_unaligned(self.root as *const pbuf) };
+        unsafe { std::slice::from_raw_parts(value.payload as *const u8, value.len as usize) }
+    }
+}
+impl TcpStream {
+    /// Emits one application-framed receive chunk; no payload copy on exclusive
+    /// contiguous pbufs with headroom. EOF is an empty Bytes (not a header-only frame).
+    pub fn poll_read_frame(self: Pin<&mut Self>, cx: &mut Context<'_>, header: &[u8]) -> Poll<io::Result<bytes::Bytes>> {
+        let me = unsafe { self.get_unchecked_mut() };
+        if me.callback_ctx.errored.load(Ordering::Acquire) { return Poll::Ready(Err(broken_pipe())); }
+        let packet = if let Some(packet) = me.read_current.take() { packet } else {
+            if me.is_eof { return Poll::Ready(Ok(bytes::Bytes::new())); }
+            match me.read_rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Err(broken_pipe())),
+                Poll::Ready(Some(0)) => {
+                    me.is_eof = true;
+                    return if me.callback_ctx.errored.load(Ordering::Acquire) {
+                        Poll::Ready(Err(broken_pipe()))
+                    } else { Poll::Ready(Ok(bytes::Bytes::new())) };
+                }
+                Poll::Ready(Some(raw)) => {
+                    let value = unsafe { std::ptr::read_unaligned(raw as *const pbuf) };
+                    ReceivedPbuf { root: raw, node: raw, offset: 0, pcb: me.pcb,
+                        length: value.tot_len, ctx: me.callback_ctx.clone(), _stack: me._stack.clone() }
+                }
+            }
+        };
+        if packet.node == packet.root && packet.offset == 0 &&
+            unsafe { crate::prepend_owned_pbuf(packet.root, header) } {
+            return Poll::Ready(Ok(bytes::Bytes::from_owner(packet)));
+        }
+        // Sniffing may have consumed a prefix; never replay those bytes.
+        let mut result = bytes::BytesMut::with_capacity(header.len() + packet.length as usize);
+        result.extend_from_slice(header);
+        let mut node = packet.node;
+        let mut offset = packet.offset;
+        while node != 0 {
+            let part = unsafe { std::ptr::read_unaligned(node as *const pbuf) };
+            let data = unsafe { std::slice::from_raw_parts(
+                (part.payload as *const u8).add(offset), part.len as usize - offset) };
+            result.extend_from_slice(data);
+            node = part.next as usize;
+            offset = 0;
+        }
+        Poll::Ready(Ok(result.freeze()))
+    }
+}
 impl AsyncRead for TcpStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let me = unsafe { self.get_unchecked_mut() };

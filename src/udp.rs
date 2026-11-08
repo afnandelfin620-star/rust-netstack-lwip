@@ -23,6 +23,7 @@ pub unsafe extern "C" fn udp_recv_cb(
     dst_port: u16_t,
 ) {
     if arg.is_null() {
+        if !p.is_null() { pbuf_free(p); }
         warn!("udp socket has been closed");
         return;
     }
@@ -35,12 +36,9 @@ pub unsafe extern "C" fn udp_recv_cb(
     let ctx = &*(arg as *const UdpSocketContext);
     let src_addr = util::to_socket_addr(&*addr, port);
     let dst_addr = util::to_socket_addr(&*dst_addr, dst_port);
-    let tot_len = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(tot_len as usize);
-    pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, tot_len, 0);
-    buf.set_len(tot_len as usize);
-    pbuf_free(p);
-    if ctx.tx.try_send((buf, src_addr, dst_addr)).is_err() {
+    if p.is_null() { return; }
+    if ctx.tx.try_send((p as usize, src_addr, dst_addr)).is_err() {
+        pbuf_free(p);
         log::trace!("netstack udp recv channel full, dropping inbound datagram");
     }
     // No manual waker: `poll_next`'s `rx.poll_recv` registers the task's waker
@@ -84,7 +82,86 @@ fn send_udp(
     }
 }
 
-type UdpPkt = (Vec<u8>, SocketAddr, SocketAddr);
+type RawUdpPkt = (usize, SocketAddr, SocketAddr);
+pub type UdpPkt = (UdpPayload, SocketAddr, SocketAddr);
+
+/// Immutable datagram ownership. Payload stays in lwIP until its final owner drops.
+#[derive(Clone)]
+pub struct UdpPayload(PayloadStorage);
+#[derive(Clone)]
+enum PayloadStorage { Bytes(bytes::Bytes), Pbuf(Arc<DatagramPbuf>) }
+struct DatagramPbuf {
+    raw: usize,
+    len: usize,
+    _stack: Arc<StackHandle>,
+    // Only parsers requiring contiguous input flatten a chained datagram.
+    flat: std::sync::OnceLock<Vec<u8>>,
+}
+impl Drop for DatagramPbuf {
+    fn drop(&mut self) {
+        let _lock = super::LWIP_MUTEX.lock();
+        unsafe { pbuf_free(self.raw as *mut pbuf); }
+    }
+}
+impl From<Vec<u8>> for UdpPayload {
+    fn from(data: Vec<u8>) -> Self { Self(PayloadStorage::Bytes(data.into())) }
+}
+impl UdpPayload {
+    /// Consumes ownership and prepends an application header in-place when safe.
+    /// Shared/chained/external pbufs fall back to a single final message allocation.
+    pub fn into_frame(mut self, header: &[u8]) -> bytes::Bytes {
+        if let PayloadStorage::Pbuf(owner) = &mut self.0 {
+            if let Some(p) = Arc::get_mut(owner) {
+                if unsafe { crate::prepend_owned_pbuf(p.raw, header) } {
+                    p.len += header.len();
+                    p.flat.take();
+                    return bytes::Bytes::from_owner(self);
+                }
+            }
+        }
+        let mut result = bytes::BytesMut::with_capacity(header.len() + self.len());
+        result.extend_from_slice(header);
+        for part in self.slices() { result.extend_from_slice(part); }
+        result.freeze()
+    }
+    pub fn len(&self) -> usize {
+        match &self.0 { PayloadStorage::Bytes(b) => b.len(), PayloadStorage::Pbuf(p) => p.len }
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn slices(&self) -> impl Iterator<Item = &[u8]> {
+        let (mut node, mut bytes) = match &self.0 {
+            PayloadStorage::Bytes(b) => (0, Some(b.as_ref())),
+            PayloadStorage::Pbuf(p) => (p.raw, None),
+        };
+        std::iter::from_fn(move || {
+            if let Some(b) = bytes.take() { return Some(b); }
+            if node == 0 { return None; }
+            let part = unsafe { std::ptr::read_unaligned(node as *const pbuf) };
+            node = part.next as usize;
+            Some(unsafe { std::slice::from_raw_parts(part.payload as *const u8, part.len as usize) })
+        })
+    }
+}
+impl std::ops::Deref for UdpPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            PayloadStorage::Bytes(b) => b,
+            PayloadStorage::Pbuf(p) => {
+                let first = unsafe { std::ptr::read_unaligned(p.raw as *const pbuf) };
+                if first.next.is_null() {
+                    return unsafe { std::slice::from_raw_parts(first.payload as *const u8, first.len as usize) };
+                }
+                p.flat.get_or_init(|| {
+                    let mut data = Vec::with_capacity(p.len);
+                    for part in self.slices() { data.extend_from_slice(part); }
+                    data
+                })
+            }
+        }
+    }
+}
+
 
 /// State shared between a `UdpSocket` and the lwIP `udp_recv` callback.
 ///
@@ -93,7 +170,7 @@ type UdpPkt = (Vec<u8>, SocketAddr, SocketAddr);
 /// a reference into `UdpSocket` itself, which would alias the `&mut` taken in
 /// `poll_next`. `Sender` is `Sync`, so the callback needs no surrounding lock.
 struct UdpSocketContext {
-    tx: Sender<UdpPkt>,
+    tx: Sender<RawUdpPkt>,
 }
 
 /// Shared ownership of the underlying lwIP `udp_pcb`.
@@ -118,7 +195,7 @@ pub struct UdpSocket {
     // never forms a reference into `UdpSocket`, which would alias the `&mut`
     // taken in `poll_next`.
     ctx: usize,
-    rx: Receiver<UdpPkt>,
+    rx: Receiver<RawUdpPkt>,
     // Keeps the shared lwIP stack alive for as long as this socket exists.
     _stack: Arc<StackHandle>,
     _pin: PhantomPinned
@@ -142,7 +219,7 @@ impl UdpSocket {
                 udp_remove(pcb);
                 return Err(Error::LwIP(err));
             }
-            let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
+            let (tx, rx): (Sender<RawUdpPkt>, Receiver<RawUdpPkt>) = channel(buffer_size);
             let ctx = Box::into_raw(Box::new(UdpSocketContext { tx })) as usize;
             let socket = Box::pin(Self {
                 pcb: Arc::new(UdpPcb(pcb as usize)),
@@ -173,6 +250,8 @@ impl Drop for UdpSocket {
         let _g = super::LWIP_MUTEX.lock();
         unsafe {
             udp_recv(self.pcb.0 as *mut udp_pcb, None, std::ptr::null_mut());
+            self.rx.close();
+            while let Ok((raw, _, _)) = self.rx.try_recv() { pbuf_free(raw as *mut pbuf); }
             // Reclaim the callback context. Safe under the lock: the callback
             // only runs while LWIP_MUTEX is held and has just been unregistered,
             // so it can no longer observe this pointer.
@@ -188,7 +267,12 @@ impl Stream for UdpSocket {
         let this = unsafe { self.get_unchecked_mut() };
         // `poll_recv` registers `cx`'s waker; the recv callback's `try_send`
         // wakes it. No separate waker handling is needed.
-        this.rx.poll_recv(cx)
+        this.rx.poll_recv(cx).map(|packet| packet.map(|(raw, src, dst)| {
+            let len = unsafe { std::ptr::read_unaligned(raw as *const pbuf).tot_len as usize };
+            (UdpPayload(PayloadStorage::Pbuf(Arc::new(DatagramPbuf {
+                raw, len, _stack: this._stack.clone(), flat: std::sync::OnceLock::new(),
+            }))), src, dst)
+        }))
     }
 }
 
@@ -234,4 +318,97 @@ impl Stream for RecvHalf {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.socket).poll_next(cx)
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_owned_datagrams(stack: Arc<StackHandle>) {
+    // Unique contiguous headroom must preserve the payload address. Shared,
+    // chained and headroom-less buffers must not be mutated.
+    for (reserve, shared, chained) in [(320, false, false), (320, true, false), (0, false, false), (320, false, true)] {
+        let (payload, address) = {
+            let _lock = super::LWIP_MUTEX.lock();
+            unsafe {
+                let p = pbuf_alloc(pbuf_layer_PBUF_RAW, reserve + 3, pbuf_type_PBUF_RAM);
+                assert!(!p.is_null());
+                assert_eq!(pbuf_remove_header(p, reserve as _), 0);
+                let address = std::ptr::addr_of!((*p).payload).read_unaligned();
+                pbuf_take(p, b"abc".as_ptr().cast(), 3);
+                if chained {
+                    let tail = pbuf_alloc(pbuf_layer_PBUF_RAW, 3, pbuf_type_PBUF_RAM);
+                    pbuf_take(tail, b"def".as_ptr().cast(), 3);
+                    pbuf_cat(p, tail);
+                }
+                (UdpPayload(PayloadStorage::Pbuf(Arc::new(DatagramPbuf {
+                    raw: p as usize, len: if chained { 6 } else { 3 },
+                    _stack: stack.clone(), flat: std::sync::OnceLock::new(),
+                }))), address as usize)
+            }
+        };
+        let retained = if shared { Some(payload.clone()) } else { None };
+        let frame = payload.into_frame(b"HEAD");
+        assert_eq!(&frame[..], if chained { b"HEADabcdef".as_slice() } else { b"HEADabc".as_slice() });
+        if reserve > 0 && !shared && !chained {
+            assert_eq!(frame[4..].as_ptr() as usize, address, "payload was copied");
+        } else { assert_ne!(frame[4..].as_ptr() as usize, address); }
+        if let Some(retained) = retained { assert_eq!(&*retained, b"abc"); }
+        let clone = frame.clone();
+        drop(frame);
+        assert!(clone.starts_with(b"HEAD"));
+    }
+
+    for _ in 0..600 {
+        let socket = UdpSocket::new(1, stack.clone()).unwrap();
+        let (_, mut receiver) = socket.split();
+        let original_payload;
+        {
+            let _lock = super::LWIP_MUTEX.lock();
+            unsafe {
+                let ip = util::to_ip_addr_t("127.0.0.1".parse().unwrap());
+                let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 16384, pbuf_type_PBUF_RAM);
+                let q = pbuf_alloc(pbuf_layer_PBUF_RAW, 16384, pbuf_type_PBUF_RAM);
+                assert!(!p.is_null() && !q.is_null());
+                original_payload = std::ptr::addr_of!((*p).payload).read_unaligned();
+                std::ptr::write_bytes(original_payload.cast::<u8>(), 0x41, 16384);
+                std::ptr::write_bytes(std::ptr::addr_of!((*q).payload).read_unaligned().cast::<u8>(), 0x42, 16384);
+                pbuf_cat(p, q);
+                let ctx = receiver.socket.ctx as *mut raw::c_void;
+                udp_recv_cb(ctx, std::ptr::null_mut(), p, &ip, 1000, &ip, 2000);
+                // Full queue must release the rejected packet under the existing lock.
+                let rejected = pbuf_alloc(pbuf_layer_PBUF_RAW, 32768, pbuf_type_PBUF_RAM);
+                assert!(!rejected.is_null());
+                udp_recv_cb(ctx, std::ptr::null_mut(), rejected, &ip, 1000, &ip, 2000);
+            }
+        }
+        let (payload, src, dst) = receiver.recv_from().await.unwrap();
+        assert_eq!(src.port(), 1000);
+        assert_eq!(dst.port(), 2000);
+        assert_eq!(payload.len(), 32768);
+        assert_eq!(payload.slices().next().unwrap().as_ptr(), original_payload as *const u8);
+        assert_eq!(payload.slices().count(), 2);
+        drop(receiver);
+        let copy = payload.clone();
+        drop(payload);
+        assert_eq!(copy.slices().next().unwrap()[0], 0x41);
+        assert_eq!(copy.slices().nth(1).unwrap()[0], 0x42);
+        // The parsing-only fallback must preserve both fragments.
+        assert_eq!(copy[16384], 0x42);
+    }
+    // Closing without consuming the queued packet must also reclaim it.
+    for _ in 0..600 {
+        let socket = UdpSocket::new(1, stack.clone()).unwrap();
+        {
+            let _lock = super::LWIP_MUTEX.lock();
+            unsafe {
+                let ip = util::to_ip_addr_t("127.0.0.1".parse().unwrap());
+                let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 65528, pbuf_type_PBUF_RAM);
+                assert!(!p.is_null());
+                udp_recv_cb(socket.ctx as *mut raw::c_void, std::ptr::null_mut(), p, &ip, 1, &ip, 2);
+            }
+        }
+        drop(socket);
+    }
+}
+
+impl AsRef<[u8]> for UdpPayload {
+    fn as_ref(&self) -> &[u8] { self }
 }
