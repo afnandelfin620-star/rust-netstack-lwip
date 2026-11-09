@@ -21,7 +21,9 @@
 #if TCP_SNDLOWAT >= TCP_SND_BUF
 #error "TCP_SNDLOWAT must be less than TCP_SND_BUF"
 #endif
-#if TCP_SNDLOWAT >= (0xFFFF - (4 * TCP_MSS))
+/* Only meaningful when snd_buf is a u16; with window scaling tcpwnd_size_t
+ * (and so snd_buf) is u32. */
+#if !LWIP_WND_SCALE && (TCP_SNDLOWAT >= (0xFFFF - (4 * TCP_MSS)))
 #error "TCP_SNDLOWAT must at least be 4*MSS below u16_t overflow"
 #endif
 #if TCP_SNDQUEUELOWAT >= TCP_SND_QUEUELEN

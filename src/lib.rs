@@ -7,6 +7,8 @@ mod tcp_stream;
 mod tcp_stream_context;
 pub mod udp;
 mod util;
+#[cfg(test)]
+mod chksum_tests;
 
 pub(crate) static LWIP_MUTEX: mutex::LwipMutex = mutex::LwipMutex::new();
 

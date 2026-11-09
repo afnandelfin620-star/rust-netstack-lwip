@@ -93,11 +93,19 @@
 #define CHECKSUM_CHECK_ICMP6 0
 
 #define LWIP_CHECKSUM_ON_COPY 1
+// Algorithm 3 is still compiled (as lwip_standard_chksum) and serves as the
+// reference implementation in the l5_chksum unit tests.
 #define LWIP_CHKSUM_ALGORITHM 3
 
-// Large-MTU experiment: keep TCP_SNDLOWAT=4*MSS and the existing
-// TCP_SNDLOWAT < 65535-4*MSS sanity check. 8191 is the largest valid MSS.
-#define TCP_MSS 8191
+// Single-pass, wide (NEON on arm64) checksum and fused copy+checksum; see
+// custom/l5_chksum.c. Replaces MEMCPY followed by a second checksum pass.
+#include <stdint.h>
+uint16_t l5_chksum(const void *dataptr, int len);
+uint16_t l5_chksum_copy(void *dst, const void *src, uint16_t len);
+#define LWIP_CHKSUM l5_chksum
+#define LWIP_CHKSUM_COPY(dst, src, len) l5_chksum_copy(dst, src, len)
+
+// TCP_MSS is set per platform below (see the note at the defaults).
 
 // TIME_WAIT lasts 2*TCP_MSL. The default MSL (60s) makes closed connections
 // linger 120s, holding a tcp_pcb each; under connection churn (a VPN carries
@@ -130,6 +138,7 @@
 #if defined __APPLE__
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
+#define TCP_MSS 8191
 #define LWIP_TCP_KEEPALIVE 1
 #define MEMP_NUM_TCP_PCB 512
 #define MEMP_NUM_TCP_SEG 4096
@@ -140,6 +149,14 @@
 #endif
 
 // Defaults for every platform not tuned above.
+#ifndef TCP_MSS
+// Empirical sweet spot on Android (tested on 23116PN5BC, Android 16, tun0 MTU 65207):
+// - 3600 (<1 page):   5.61B user + 13.73B kernel = 19.35B instr/GiB (2.3x syscall/packet overhead)
+// - 8191 (~2 pages):  5.41B user +  6.72B kernel = 12.13B instr/GiB (best overall)
+// - 16324 (~4 pages): 5.40B user + 10.14B kernel = 15.54B instr/GiB (+51% kernel skb overhead)
+// - 65147 (~64 KiB):  persistent ENOBUFS (errno 105) on TUN write, causing RTO stalls
+#define TCP_MSS 8191
+#endif
 #ifndef MEMP_NUM_TCP_PCB
 #define MEMP_NUM_TCP_PCB 2048
 #endif
@@ -153,7 +170,9 @@
 #endif
 #ifndef TCP_SND_BUF
 #define TCP_SND_BUF (256 * 1024)
+#ifndef TCP_SNDLOWAT
 #define TCP_SNDLOWAT (4 * TCP_MSS)
+#endif
 #endif
 #ifndef MEM_SIZE
 #define MEM_SIZE (32 * 1024 * 1024)

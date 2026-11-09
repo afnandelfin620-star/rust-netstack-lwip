@@ -157,11 +157,17 @@ impl NetStack {
 }
 
 /// Keeps the callback alive and disables output before releasing its resources.
-pub struct DirectOutput { stack: Arc<StackHandle>, errors: tokio::sync::watch::Receiver<Option<io::ErrorKind>> }
+pub struct DirectOutput { stack: Arc<StackHandle>, errors: tokio::sync::watch::Receiver<crate::output::OutputError> }
 impl DirectOutput {
     pub async fn wait_error(&mut self) -> io::Error {
         loop {
-            if let Some(kind) = *self.errors.borrow_and_update() { return io::Error::new(kind, "direct TUN output failed"); }
+            if let Some((kind, os)) = *self.errors.borrow_and_update() {
+                let msg = match os {
+                    Some(code) => format!("direct TUN output failed: {kind:?} (os error {code})"),
+                    None => format!("direct TUN output failed: {kind:?}"),
+                };
+                return io::Error::new(kind, msg);
+            }
             if self.errors.changed().await.is_err() { return io::ErrorKind::BrokenPipe.into(); }
         }
     }

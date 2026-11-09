@@ -14,7 +14,26 @@ pub static OUTPUT_CB_PTR: AtomicUsize = AtomicUsize::new(0);
 pub struct DirectOutputStats {
     pub would_block_packets: u64,
     pub would_block_bytes: u64,
+    /// Dropped because the kernel could not allocate the packet buffer
+    /// (ENOBUFS/ENOMEM, e.g. under memory pressure). TCP retransmits them.
+    pub no_buffer_packets: u64,
+    pub no_buffer_bytes: u64,
 }
+
+/// Kernel packet-buffer exhaustion on a TUN write. Transient, like WouldBlock:
+/// failing the whole TUN pipeline for it would tear down the VPN.
+fn is_no_buffer(e: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const ENOBUFS: i32 = 105;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const ENOBUFS: i32 = 55;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+    const ENOBUFS: i32 = i32::MIN;
+    e.kind() == std::io::ErrorKind::OutOfMemory || e.raw_os_error() == Some(ENOBUFS)
+}
+
+/// Fatal output error: kind plus the raw OS error, if any, for diagnosis.
+pub(crate) type OutputError = Option<(std::io::ErrorKind, Option<i32>)>;
 
 pub fn direct_output_stats() -> DirectOutputStats {
     let _lock = crate::LWIP_MUTEX.lock();
@@ -31,7 +50,7 @@ pub fn direct_output_stats() -> DirectOutputStats {
 pub(crate) type PacketWriter = dyn Fn(&[std::io::IoSlice<'_>]) -> std::io::Result<usize> + Send + Sync;
 pub(crate) enum OutputTarget {
     Channel(Sender<Vec<u8>>), // Compatibility for in-process peers/tests, not Android TUN.
-    Direct { writer: Box<PacketWriter>, errors: tokio::sync::watch::Sender<Option<std::io::ErrorKind>>, failed: bool, stats: DirectOutputStats },
+    Direct { writer: Box<PacketWriter>, errors: tokio::sync::watch::Sender<OutputError>, failed: bool, stats: DirectOutputStats },
     Disabled,
 }
 
@@ -70,9 +89,19 @@ fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
                         // Deliberate drop: TCP retains data for retransmission; UDP does not.
                         err_enum_t_ERR_OK as err_t
                     }
+                    Err(e) if is_no_buffer(&e) => {
+                        stats.no_buffer_packets = stats.no_buffer_packets.saturating_add(1);
+                        stats.no_buffer_bytes = stats.no_buffer_bytes.saturating_add(std::ptr::read_unaligned(p).tot_len as u64);
+                        // Rare by nature: log at 1, 2, 4, 8, ... occurrences only.
+                        if stats.no_buffer_packets.is_power_of_two() {
+                            log::warn!("TUN write dropped, kernel out of buffers ({} so far): {}", stats.no_buffer_packets, e);
+                        }
+                        // Same deliberate drop as WouldBlock.
+                        err_enum_t_ERR_OK as err_t
+                    }
                     Err(e) => {
                         *failed = true;
-                        errors.send_replace(Some(e.kind()));
+                        errors.send_replace(Some((e.kind(), e.raw_os_error())));
                         err_enum_t_ERR_IF as err_t
                     }
                 }
@@ -141,7 +170,7 @@ pub extern "C" fn output_ip6(netif: *mut netif, p: *mut pbuf, ipaddr: *const ip6
 #[cfg(test)]
 pub(crate) async fn verify_direct_output(stack: &crate::NetStack) {
     use std::{io, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
-    for (mode, node_count) in [(0, 1), (0, 70), (1, 70), (2, 70), (3, 70), (4, 70)] {
+    for (mode, node_count) in [(0, 1), (0, 70), (1, 70), (2, 70), (3, 70), (4, 70), (5, 70), (6, 70)] {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let address = Arc::new(AtomicUsize::new(0));
@@ -158,6 +187,11 @@ pub(crate) async fn verify_direct_output(stack: &crate::NetStack) {
                 2 if call == 0 => Err(io::ErrorKind::Interrupted.into()),
                 3 => Ok(len - 1),
                 4 => Err(io::ErrorKind::BrokenPipe.into()),
+                5 => Err(io::ErrorKind::OutOfMemory.into()),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                6 => Err(io::Error::from_raw_os_error(105)), // ENOBUFS
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                6 => Err(io::ErrorKind::OutOfMemory.into()),
                 _ => Ok(len),
             }
         }).unwrap();
@@ -175,7 +209,7 @@ pub(crate) async fn verify_direct_output(stack: &crate::NetStack) {
                 }
                 address.store(std::ptr::addr_of!((*root).payload).read_unaligned() as usize, Ordering::Relaxed);
                 let result = output(std::ptr::null_mut(), root);
-                assert_eq!(result, if mode >= 3 { err_enum_t_ERR_IF as err_t } else { err_enum_t_ERR_OK as err_t });
+                assert_eq!(result, if mode == 3 || mode == 4 { err_enum_t_ERR_IF as err_t } else { err_enum_t_ERR_OK as err_t });
                 assert_eq!(std::ptr::read_unaligned(root).tot_len as usize, node_count);
                 pbuf_free(root); // callback never takes ownership
             }
@@ -183,8 +217,10 @@ pub(crate) async fn verify_direct_output(stack: &crate::NetStack) {
         let stats = direct_output_stats();
         assert_eq!(stats.would_block_packets, if mode == 1 { 1 } else { 0 });
         assert_eq!(stats.would_block_bytes, if mode == 1 { node_count as u64 } else { 0 });
+        assert_eq!(stats.no_buffer_packets, if mode >= 5 { 1 } else { 0 });
+        assert_eq!(stats.no_buffer_bytes, if mode >= 5 { node_count as u64 } else { 0 });
         assert_eq!(calls.load(Ordering::Relaxed), if mode == 2 { 2 } else { 1 });
-        if mode >= 3 {
+        if mode == 3 || mode == 4 {
             let e = registration.wait_error().await;
             assert_eq!(e.kind(), if mode == 3 { io::ErrorKind::WriteZero } else { io::ErrorKind::BrokenPipe });
         }
