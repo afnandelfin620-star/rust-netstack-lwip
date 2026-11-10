@@ -239,7 +239,10 @@ impl StackInput {
             io::Error::new(io::ErrorKind::NotConnected, "netif input missing"))?;
         let err = input(raw, netif_list);
         if err != err_enum_t_ERR_OK as err_t {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("netif input failed: {err}")));
+            let kind = if [err_enum_t_ERR_VAL as err_t,err_enum_t_ERR_ARG as err_t,err_enum_t_ERR_BUF as err_t].contains(&err) {io::ErrorKind::InvalidData}
+                else if err == err_enum_t_ERR_MEM as err_t {io::ErrorKind::OutOfMemory}
+                else {io::ErrorKind::Other};
+            return Err(io::Error::new(kind, format!("netif input failed: {err}")));
         }
         std::mem::forget(owned);
         Ok(n)
@@ -411,6 +414,9 @@ mod error_lifecycle_tests {
                 wire[22..24].copy_from_slice(&443u16.to_be_bytes());
                 wire[24..26].copy_from_slice(&((size - 20) as u16).to_be_bytes());
                 unsafe {
+                    // A consumed/rejected datagram must not leak the allocation
+                    // or poison the next valid packet's direct ingestion.
+                    assert_eq!(input.ingest_packet_with(size+1,|_|Err(io::ErrorKind::InvalidData.into())).unwrap_err().kind(),io::ErrorKind::InvalidData);
                     assert_eq!(input.ingest_packet_with(size + 1, |buf| {
                         for (dst, src) in buf.iter_mut().zip(&wire) { dst.write(*src); }
                         Ok(size)
